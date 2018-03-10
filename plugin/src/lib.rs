@@ -1,4 +1,4 @@
-#![feature(plugin_registrar, quote, rustc_private, custom_attribute, try_from)]
+#![feature(custom_attribute, plugin_registrar, quote, rustc_private, try_from)]
 
 extern crate rustc_plugin;
 extern crate syntax;
@@ -74,6 +74,8 @@ struct MethodInfo {
     /// which inputs have the same type and could be switched?
     /// TODO refs vs. values
     interchangeables: HashMap<Symbol, Vec<Symbol>>,
+    /// which inputs are mutable refs
+    ref_muts: Vec<Symbol>,
 }
 
 #[derive(Default)]
@@ -143,10 +145,17 @@ impl<'a, 'cx> MutatorPlugin<'a, 'cx> {
                 );
             }
         }
+        let ref_muts = decl.inputs
+            .iter()
+            .filter(|arg| is_ref_mut(arg))
+            .filter_map(|arg| get_pat_name_mut(&arg.pat))
+            .map(|(name, _mutability)| name)
+            .collect::<Vec<_>>();
         self.info.method_infos.push(MethodInfo {
             is_default,
             have_output_type,
             interchangeables,
+            ref_muts,
         });
     }
 
@@ -320,7 +329,7 @@ impl<'a, 'cx> Folder for MutatorPlugin<'a, 'cx> {
                 attrs: _,
             } => {
                 // self.cx.expander().fold_expr(P(e)).map(|e| fold::noop_fold_expr(e, self))
-                // ignore macros for now
+                // ignore macros for now. If we ever expand macros we mustavoid mutating assert!s
                 P(e)
             }
             Expr {
@@ -594,28 +603,60 @@ impl<'a, 'cx> Folder for MutatorPlugin<'a, 'cx> {
             }
             Expr {
                 id,
-                node: ExprKind::Unary(UnOp::Neg, exp),
+                node: ExprKind::Unary(op, exp),
                 span,
                 attrs,
-            } => {
-                let exp = exp.and_then(|e| {
-                    let maybe_exp = match &e.node {
-                        &ExprKind::Lit(ref lit) => {
-                            self.mutate_numeric_constant_expression(&lit, true)
-                        }
-                        _ => None,
-                    };
-
-                    maybe_exp.unwrap_or_else(|| P(e))
-                });
-
-                P(Expr {
+            } => match op {
+                UnOp::Neg => {
+                    let exp = exp.and_then(|e| {
+                        let maybe_exp = match &e.node {
+                            &ExprKind::Lit(ref lit) => {
+                                self.mutate_numeric_constant_expression(&lit, true)
+                            }
+                            _ => None,
+                        };
+                        maybe_exp.unwrap_or_else(|| P(e))
+                    });
+                    let neg_exp = P(Expr {
+                        id,
+                        node: ExprKind::Unary(UnOp::Neg, exp),
+                        span,
+                        attrs,
+                    });
+                    let n;
+                    {
+                        n = self.current_count;
+                        add_mutations(
+                            &self.cx,
+                            &mut self.mutations,
+                            &mut self.current_count,
+                            expr.span,
+                            &["replace !x with x"],
+                        );
+                    }
+                    quote_expr!(&self.cx, ::mutagen::MayNeg::neg($neg_exp, $n))
+                }
+                UnOp::Not => {
+                    let n;
+                    {
+                        n = self.current_count;
+                        add_mutations(
+                            &self.cx,
+                            &mut self.mutations,
+                            &mut self.current_count,
+                            expr.span,
+                            &["replace !x with x"],
+                        );
+                    }
+                    quote_expr!(&self.cx, ::mutagen::MayNot::not($exp, $n))
+                }
+                _ => P(Expr {
                     id,
-                    node: ExprKind::Unary(UnOp::Neg, exp),
+                    node: ExprKind::Unary(op, exp),
                     span,
                     attrs,
-                })
-            }
+                }),
+            },
             Expr {
                 id,
                 node: ExprKind::Lit(lit),
@@ -691,6 +732,7 @@ fn fold_first_block(block: P<Block>, m: &mut MutatorPlugin) -> P<Block> {
             is_default,
             ref have_output_type,
             ref interchangeables,
+            ref ref_muts,
         }) = info.method_infos.last()
         {
             if is_default {
@@ -726,6 +768,27 @@ fn fold_first_block(block: P<Block>, m: &mut MutatorPlugin) -> P<Block> {
             }
             //TODO: switch interchangeables, need mutability info, too
             //for name in method_info.interchangeables { }
+            for name in ref_muts {
+                let n = *current_count;
+                let ident = name.to_ident();
+                let ident_clone = Symbol::gensym(&format!("{}_clone", name.as_str())).to_ident();
+                add_mutations(
+                    cx,
+                    mutations,
+                    current_count,
+                    block.span,
+                    &[&format!("clone ref mut {}", name)],
+                );
+                pre_stmts.push(
+                    quote_stmt!(cx,
+                    let mut $ident_clone;
+                    if ::mutagen::MayClone::may_clone($ident) && ::mutagen::now($n) {
+                        $ident_clone = MayClone::clone($ident, $n);
+                        $ident = &mut $ident_clone;
+                    }
+                ).unwrap(),
+                );
+            }
         }
     }
     if pre_stmts.is_empty() {
@@ -779,6 +842,25 @@ fn get_pat_name_mut(pat: &Pat) -> Option<(Symbol, Mutability)> {
     } else {
         None
     }
+}
+
+fn is_ref_mut(arg: &Arg) -> bool {
+    // ref mut pattern
+    if let PatKind::Ident(BindingMode::ByRef(Mutability::Mutable), _, _) = arg.pat.node {
+        return true;
+    }
+    // &mut type
+    if let TyKind::Rptr(
+        _,
+        MutTy {
+            ty: _,
+            mutbl: Mutability::Mutable,
+        },
+    ) = arg.ty.node
+    {
+        return true;
+    }
+    false
 }
 
 static ALWAYS_DEFAULT: &[&[&str]] = &[
